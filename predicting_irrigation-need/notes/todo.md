@@ -7,3 +7,4 @@
       - Create a notebook ✅
       - Create correlation graphs to determine important features
       - Add enhancement to the script
+      - New point

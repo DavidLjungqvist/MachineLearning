@@ -28,11 +28,16 @@ def add_original(df_train, df_original, originals=1):
             df_train = pd.concat([df_train, df_orig_aligned], ignore_index=True, sort=False)  # concat keeping df_train's column set
     return df_train
 
+def dummy():
+    pass
+
 def main():
     df_train, df_test, df_original = read_data("train.csv", "test.csv", "original.csv")
     print(len(df_train))
     df_train = add_original(df_train, df_original, originals=1)
     print(len(df_train))
+
+
 
 
 main()
