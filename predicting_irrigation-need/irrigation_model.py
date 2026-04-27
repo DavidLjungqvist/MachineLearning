@@ -3,9 +3,10 @@ import numpy as np
 import time
 import sys
 import os
+from math import floor
 
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from xgboost import XGBClassifier
 import lightgbm
 from catboost import CatBoostClassifier
@@ -14,7 +15,8 @@ from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
 
 INCLUDE_ORIGINAL = True
 VERBOSE = True
-VALIDATE_MODELS = True
+VALIDATE_MODELS = False
+GENERATE_PREDICTION = True
 
 def read_data(train="train.csv", test="test.csv", original="original.csv"):
     df_train = pd.read_csv(train)
@@ -275,8 +277,9 @@ def target_to_array(y):
     # transform y into an array
     y_str = y.astype(str)
     le = LabelEncoder().fit(y_str)
-    y = le.transform(y_str)
-    return y
+    # y = le.transform(y_str)
+    y_encoded = le.transform(y_str)
+    return y_encoded, le
 
 def target_classes_count(y):
     # how many different classes does the target have?
@@ -286,22 +289,125 @@ def target_classes_count(y):
         print(f"{n_classes=}")
     return n_classes
 
+def model_for_submission_lgbm(x_training, y, seeds):
+    # train models and keep them in a list
+    models = []
+    kwargs = {
+        # "objective": "binary",
+        # "metric": "binary_logloss",
+        # "boosting_type": "gbdt",
+        "n_estimators": 300,
+        "learning_rate": 0.08,
+        "num_leaves": 50,
+        "max_depth": 5,
+        "min_child_samples": 80,
+        "subsample": 0.8,
+        "colsample_bytree": 0.15,
+        "reg_alpha": 8.14,
+        "reg_lambda": 0.00428,
+        "random_state": 44,
+        "metric": "multi_logloss",
+        "n_jobs": -1,
+        "verbosity": -1,
+    }
+
+    print("Fitting    ", end="")
+    for s in seeds:
+        # take 80% of the trainingsdata, then split these 80% again to obtain trainings and validation data
+        x_train, _, y_train, _ = train_test_split(x_training, y, test_size=0.2, random_state=s, stratify=y)
+        x_tr, x_val, y_tr, y_val = train_test_split(x_train, y_train, test_size=0.2, random_state=s, stratify=y_train)
+        suppress_python_output()
+        model = lightgbm.LGBMClassifier(**kwargs)
+        model.fit(x_tr, y_tr, eval_set=[(x_val, y_val)])
+        restore_python_output()
+        models.append(model)
+        print(".", end="")
+    print(f"{len(seeds)} fits done.")
+    return models
+
+
+def predict_and_average_probabilities(models, x_test):
+    probs = []
+    print("Predicting ", end="")
+
+    for model in models:
+        bi = getattr(model, "best_iteration", None)
+        if bi is not None:
+            p = model.predict_proba(x_test, iteration_range=(0, bi + 1))
+        else:
+            p = model.predict_proba(x_test)
+
+        probs.append(p)  # keep ALL classes
+        print(".", end="")
+
+    print(f"{len(models)} predictions done.")
+
+    probs_arr = np.stack(probs)  # (n_models, n_samples, n_classes)
+    mean_prob = probs_arr.mean(axis=0)  # (n_samples, n_classes)
+
+    return mean_prob
+
+# def save_submission(x_test, mean_prob):
+    # submission_df = pd.DataFrame(mean_prob, columns=["class_0", "class_1", "class_2"])
+    # submission_df.insert(0, "id", x_test["id"])
+    #
+    # submission_df.to_csv("submission.csv", index=False)
+    # print("Saved submission.csv")
+def save_submission(x_test, mean_prob, le):
+    # convert probabilities → class index
+    labels_encoded = np.argmax(mean_prob, axis=1)
+
+    # convert index → original labels (Low/Medium/High)
+    labels = le.inverse_transform(labels_encoded)
+
+    submission_df = pd.DataFrame({
+        "id": x_test["id"],
+        "Irrigation_Need": labels
+    })
+
+    submission_df.to_csv("submission.csv", index=False)
+    print("Saved submission.csv")
+
+def add_derived_features(dataframes):
+    enhanced_dataframes = []
+    for df in dataframes:
+        df["soil_lt25"] = (df["Soil_Moisture"] < 25).astype(int)
+        df["temp_gt_30"] = (df["Temperature_C"] > 30).astype(int)
+        df["rain_lt_300"] = (df["Rainfall_mm"] < 300).astype(int)
+        df["wind_gt_10"] = (df["Wind_Speed_kmh"] > 10).astype(int)
+        enhanced_dataframes.append(df)
+    return enhanced_dataframes
+
 def main():
     df_train, df_test, df_original = read_data("train.csv", "test.csv", "original.csv")
     df_train = add_original(df_train, df_original, originals=1)
+
+    df_train, df_test = add_derived_features([df_train, df_test])
 
     one_hot_features = ["Soil_Type", "Crop_Type", "Crop_Growth_Stage", "Season", "Irrigation_Type", "Water_Source", "Mulching_Used", "Region"]
 
     x_training, x_test = one_hot_encode([df_train, df_test], one_hot_features)
     y_init = x_training["Irrigation_Need"]  # the target
     x_training = x_training.drop(columns=["Irrigation_Need"])
-    y = target_to_array(y_init)  # transform target into an array
+    y, le = target_to_array(y_init)  # transform target into an array
     n_classes = target_classes_count(y)
     if VALIDATE_MODELS:  # execute only if validating (many) models
         # if MODEL_STACKING:
         #     stack_and_validate_some_models(x_training, y, n_classes)
         # else:
         validate_many_models(x_training, y, n_classes)
+    if GENERATE_PREDICTION:
+        start = time.perf_counter()
+        x_test_final = x_test[x_training.columns]
+        seeds = list(range(40))
+        models = model_for_submission_lgbm(x_training, y, seeds)
+        mean_prob = predict_and_average_probabilities(models, x_test_final)
+        save_submission(x_test, mean_prob, le)
+        end = time.perf_counter()
+        completion_time = end - start
+        mins = floor(completion_time / 60)
+        secs = completion_time - (mins * 60)
+        print(f"Generated predition in {mins} minutes and {secs} seconds")
 
 
 main()

@@ -6,5 +6,5 @@
     - Feature enhancement
       - Create a notebook ✅
       - Create correlation graphs to determine important features
-      - Add enhancement to the script
-      - New point
+      - Add "Cheat" enhancement to the script
+      - Examine how they were discovered
